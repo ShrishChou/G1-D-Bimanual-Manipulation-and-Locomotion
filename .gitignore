@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# large / generated artifacts -- never commit weights, datasets, or logs
+*.pt
+*.pth
+*.safetensors
+checkpoints/
+datasets/
+*.parquet
+*.log
+*.csv
+
+# media: ignore everything EXCEPT the curated demo videos in docs/videos
+*.mp4
+*.png
+*.jpg
+!docs/videos/*.mp4
