@@ -19,3 +19,10 @@ datasets/
 *.png
 *.jpg
 !docs/videos/*.mp4
+!docs/videos/*.gif
+!docs/videos/*.png
+
+# fetched robot model (public Unitree G1, pulled by scripts/fetch_g1_assets.py)
+assets/g1/
+# procedurally generated scene meshes
+sim/assets/

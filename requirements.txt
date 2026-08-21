@@ -1,0 +1,24 @@
+# --- digital twin (everything in sim/ and nav/nav_planner.py + nav/nav_fsm.py) ---
+# these alone are enough to run the full pipeline offline, no GPU and no robot
+mujoco>=3.2
+numpy>=1.26
+opencv-python>=4.9
+imageio>=2.34
+imageio-ffmpeg>=0.5
+
+# --- optional: live digital twin ---
+# rerun-sdk>=0.18
+
+# --- optional: robot deployment (Unitree G1-D) ---
+# unitree_sdk2py            # DDS transport + LocoClient   (github.com/unitreerobotics/unitree_sdk2_python)
+# pin                       # Pinocchio, for end-effector FK/IK
+# pyzmq                     # AprilTag pose bridge
+# json-numpy                # numpy-aware JSON for the inference client
+# requests
+
+# --- optional: SLAM / Nav2 ---
+# ROS 2 + nav2_bringup, and Slamtec's slamware_ros_sdk (github.com/Slamtec/slamware_ros_sdk).
+# Installed through the ROS 2 toolchain rather than pip.
+
+# --- optional: training / policy ---
+# Isaac-GR00T (github.com/NVIDIA/Isaac-GR00T) -- follow its own install; needs Python 3.10 + CUDA.
