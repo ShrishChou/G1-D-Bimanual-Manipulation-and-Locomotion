@@ -20,6 +20,8 @@ import sys
 
 import numpy as np
 import mujoco
+import pathlib
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "nav"))
 import nav_planner as N
@@ -32,7 +34,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 G1_XML = os.environ.get("G1_XML", os.path.join(HERE, "..", "assets", "g1", "g1_with_hands.xml"))
 CONTAINER_OBJ = os.path.join(HERE, "assets", "container.obj")
 
-TOP = 0.74
+# Work-surface height. 0.90 m sits inside the measured bimanual reach envelope of BOTH
+# supported robots: the legged G1 reaches 0.74-1.07 m, while the taller wheeled G1-D cannot
+# bring its palms below ~0.92 m at all, so a standard 0.74 m bench is unreachable for it.
+TOP = 0.90
 STAND_H = 4 * IN
 CYL_R, CYL_H = 0.045, 0.1822                     # target object: upright cylinder
 CYL_STAND_QUAT = [1, 0, 0, 0]                    # a MuJoCo cylinder primitive is already +z
@@ -44,6 +49,83 @@ GOAL = (0.0, CONT_XY[1] - 0.55)                  # robot drop stance: centered o
 START = (0.0, 0.0)
 PKG = [11 * IN / 2, 7 * IN / 2, 5 * IN / 2]
 ROBOT_RADIUS = 0.18
+
+
+_ROBOT_XML = None      # resolved once by _init_robot()
+_BASE_Z = None
+
+
+def floating_base_xml(path):
+    """Return an MJCF guaranteed to have a floating base, writing a sibling file if one is needed.
+
+    The wheeled G1-D's URDF roots at ``AGV_link`` through a fixed joint, so the importer folds the
+    chassis straight into the worldbody: the robot is bolted to the origin and cannot be driven
+    anywhere. Wrap the worldbody's bodies AND its loose geoms in one free-jointed body -- the chassis
+    and the outer lift column are worldbody geoms, and leaving them behind strands them at the origin
+    while the rest of the robot drives off. No-op when the asset already has a free joint.
+
+    The rewritten file is written beside the source so ``compiler meshdir`` still resolves.
+    """
+    path = pathlib.Path(path)
+    tree = ET.parse(path)
+    world = tree.getroot().find("worldbody")
+    if world is None or tree.getroot().findall(".//freejoint") or \
+            any(j.get("type") == "free" for j in tree.getroot().iter("joint")):
+        return path
+    movable = [c for c in list(world) if c.tag in ("body", "geom", "site")]
+    if not movable:
+        return path
+    base = ET.Element("body", {"name": "floating_base"})
+    ET.SubElement(base, "freejoint", {"name": "base_free"})
+    # The chassis inertial was merged into the world, leaving the wrapper massless, which MuJoCo
+    # rejects. This twin runs forward kinematics only, so a nominal value never reaches a dynamics
+    # computation.
+    ET.SubElement(base, "inertial", {"pos": "0 0 0.2", "mass": "40", "diaginertia": "2 2 2"})
+    for c in movable:
+        world.remove(c)
+        base.append(c)
+    world.append(base)
+    out = path.with_name("_" + path.stem + "_floating.xml")
+    tree.write(out)
+    return out
+
+
+def base_stand_height(xml_path):
+    """Base height that puts the lowest geometry (wheels or feet) exactly on the floor.
+
+    Compiled from the ROBOT ALONE -- measuring on the assembled scene does not work, because an
+    infinite ground plane carries a huge AABB that swamps the minimum and the tables would clamp it
+    to zero. Measured from each geom's AABB corners rotated into the world: ``geom_rbound`` is a
+    bounding SPHERE and over-estimates by enough to sink a humanoid most of a metre into the floor,
+    and the geom frame origin is ~17 cm off on a mesh like the AGV chassis. Starts from the asset's
+    own ``qpos0`` so a model that already ships standing is left where its author put it.
+    """
+    model = mujoco.MjSpec.from_file(str(xml_path)).compile()
+    data = mujoco.MjData(model)
+    data.qpos[:] = model.qpos0
+    mujoco.mj_forward(model, data)
+    lo = np.inf
+    for g in range(model.ngeom):
+        if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE:
+            continue
+        centre, half = model.geom_aabb[g][:3], model.geom_aabb[g][3:]
+        rot = data.geom_xmat[g].reshape(3, 3)
+        pos = data.geom_xpos[g]
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                for sz in (-1, 1):
+                    corner = centre + half * np.array([sx, sy, sz], float)
+                    lo = min(lo, float((pos + rot @ corner)[2]))
+    return float(model.qpos0[2] - lo)
+
+
+def _init_robot():
+    """Resolve the robot MJCF (adding a floating base if needed) and its stand height, once."""
+    global _ROBOT_XML, _BASE_Z
+    if _ROBOT_XML is None:
+        _ROBOT_XML = floating_base_xml(G1_XML)
+        _BASE_Z = base_stand_height(_ROBOT_XML)
+    return _ROBOT_XML, _BASE_Z
 
 
 def _make_container(path):
@@ -110,7 +192,8 @@ def quat_z(deg):
 def build(packages, path=None, intruder=None):
     """Build the MjModel. Returns (model, info). cylinder has a freejoint (kinematic control in the animation).
     `intruder` (x,y) adds a red obstacle that is NOT in the planned occupancy -- used to demo the failsafe."""
-    spec = mujoco.MjSpec.from_file(G1_XML)
+    robot_xml, base_z = _init_robot()
+    spec = mujoco.MjSpec.from_file(str(robot_xml))
     wb = spec.worldbody
     wb.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[12, 12, 0.1], rgba=[0.3, 0.32, 0.35, 1])
     wb.add_light(pos=[0.5, 1, 4], dir=[-0.1, -0.1, -1], type=int(mujoco.mjtLightType.mjLIGHT_DIRECTIONAL))
@@ -156,9 +239,15 @@ def build(packages, path=None, intruder=None):
             seg.add_geom(type=mujoco.mjtGeom.mjGEOM_CAPSULE, fromto=[x0, y0, 4 * IN, x1, y1, 4 * IN],
                          size=[0.015, 0, 0], rgba=[0.2, 0.5, 1.0, 1], contype=0, conaffinity=0)
 
+    # The scene is lit from above, so at a low camera elevation the table sides and the
+    # robot's own front face read almost black. Ambient fill fixes that without washing out
+    # the directional shadows that make the depth legible.
+    spec.visual.headlight.ambient = [0.35, 0.35, 0.35]
+    spec.visual.headlight.diffuse = [0.45, 0.45, 0.45]
     spec.visual.global_.offwidth = 1280
     spec.visual.global_.offheight = 720
     model = spec.compile()
     gb = model.body("cylinder")
-    info = {"cyl_qadr": int(model.jnt_qposadr[gb.jntadr[0]]), "packages": packages}
+    info = {"cyl_qadr": int(model.jnt_qposadr[gb.jntadr[0]]), "packages": packages,
+            "base_z": base_z}
     return model, info

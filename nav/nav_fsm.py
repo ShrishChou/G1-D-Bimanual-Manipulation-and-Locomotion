@@ -38,7 +38,7 @@ FRONT_DEG = 60        # +/- half-angle of the front danger sector
 ARM_HOME = np.zeros(7)
 # Bimanual grasp geometry. The arm can only reach ~0.35 m forward at table height (measured on the
 # model, not assumed), so the base drives to a standoff first instead of over-reaching.
-PICK_STANDOFF = 0.30       # m: pelvis-to-object distance for the grasp
+PICK_STANDOFF = 0.28       # m: base-to-object distance (inside both robots' envelopes)
 PREGRASP_BACK = 0.13       # m: hands start this far behind the object, and this much wider
 GRASP_HALF_W = 0.085       # m: palm offset either side of a 45 mm-radius cylinder
 LIFT_H = 0.12              # m: how far the object is lifted off the table
@@ -83,6 +83,9 @@ class SimIO:
         self.gadr = info["cyl_qadr"]
         self.x, self.y, self.yaw = 0.0, 0.0, 0.0
         self.kin = Kin(self.model)
+        self.base_z = info["base_z"]   # measured per robot: wheels or feet on the floor
+        self.lift = 0.0                # Z-lift extension (wheeled bases only)
+        self.odo = 0.0                 # distance travelled, for rolling the wheels
         self.armL, self.armR = ARM_HOME.copy(), ARM_HOME.copy()
         self.handL, self.handR = OPEN.copy(), OPEN.copy()
         self.cylinder = [*S.CYL_XY, S.TOP, *S.CYL_STAND_QUAT]
@@ -125,6 +128,7 @@ class SimIO:
         self.yaw = wrap(self.yaw + vyaw * dt)
         self.x += vx * np.cos(self.yaw) * dt
         self.y += vx * np.sin(self.yaw) * dt
+        self.odo += abs(vx) * dt
 
     def stop(self):
         pass
@@ -141,9 +145,11 @@ class SimIO:
         return qL, qR, err
 
     def render(self):
-        self.d.qpos[0:3] = [self.x, self.y, 0.793]
+        self.d.qpos[0:3] = [self.x, self.y, self.base_z]
         self.d.qpos[3:7] = yaw_quat(self.yaw)
         self.kin.apply(self.d, self.armL, self.armR, self.handL, self.handR)
+        self.kin.set_lift(self.d, self.lift)
+        self.kin.spin_wheels(self.d, self.odo)
         mujoco.mj_forward(self.model, self.d)
         if self.carry:
             # the object is held BETWEEN the hands, so it rides the palm midpoint
@@ -176,11 +182,17 @@ class SimIO:
         """
         obj = np.array([*S.CYL_XY, S.TOP + S.CYL_H / 2])
 
-        # 1) drive to a standoff where the grasp is actually inside the arm workspace
-        stand_x = obj[0] - PICK_STANDOFF
-        while self.x < stand_x - 0.01 and not ESTOP["tripped"]:
-            self.drive(V_FWD, -np.clip(2.0 * wrap(0.0 - self.yaw), -W_TURN, W_TURN), 1 / 30)
+        # 1) close to a standoff where the grasp is inside the arm workspace. Measured as a DISTANCE
+        # along the current heading, not a world-x threshold -- the caller may already have turned to
+        # face the object (the staged deployment sequence does exactly that).
+        while not ESTOP["tripped"]:
+            d_obj = float(np.hypot(obj[0] - self.x, obj[1] - self.y))
+            if d_obj <= PICK_STANDOFF + 0.01:
+                break
+            err = wrap(np.arctan2(obj[1] - self.y, obj[0] - self.x) - self.yaw)
+            self.drive(V_FWD * max(0.25, 1 - abs(err)), np.clip(1.5 * err, -W_TURN, W_TURN), 1 / 30)
             self.render()
+        self.drive(0, 0, 1 / 30)
 
         # 2) pre-grasp: hands open, apart and behind the object
         qL0, qR0, _ = self._solve_grasp(obj, GRASP_HALF_W + PREGRASP_BACK, back=PREGRASP_BACK)

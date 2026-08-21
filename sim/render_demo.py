@@ -37,10 +37,10 @@ def demo_camera():
     cylinder are the thing worth seeing, and from the FSM's default angle the table is in the way.
     """
     cam = mujoco.MjvCamera()
-    cam.lookat[:] = [0.5, 0.0, 0.85]
+    cam.lookat[:] = [0.5, 0.0, 0.95]
     cam.distance = 2.9
     cam.azimuth = 150
-    cam.elevation = -16
+    cam.elevation = -24
     return cam
 
 
@@ -53,7 +53,7 @@ class TrackingIO(F.SimIO):
     off-screen behind the robot.
     """
 
-    LOOK_OFFSET = np.array([0.18, 0.10, 0.85])   # look slightly ahead of the base, at chest height
+    LOOK_OFFSET = np.array([0.18, 0.10, 0.95])   # look slightly ahead of the base, at chest height
     SMOOTH = 0.12                                # lerp factor: kills per-frame jitter
 
     def __init__(self, *a, look_at_also=None, **kw):
@@ -97,6 +97,105 @@ def to_gif(mp4, gif, width=460, fps=12, speed=2.6, max_seconds=None):
     return len(frames), os.path.getsize(gif)
 
 
+IN = 0.0254
+
+
+def run_deploy_sequence(io, place_target):
+    """Replay the on-robot deployment sequence in the twin, then hand off to the navigation FSM.
+
+    Mirrors deploy/deploy_pick.py stage for stage. On the robot each stage is a different channel --
+    base over cmd_vel, trunk over cmd_hispeed, arms/hands over the arm controller -- and they are
+    driven independently so they coexist without mode switching. Here they are the same three groups,
+    stepped in the same order:
+
+        1) base forward  --fwd0   (30 cm)
+        2) base turn     --turn   (to face the table)
+        3) arms -> inference start pose
+        4) trunk up      --trunk-up (3 in)
+        5) base forward  --fwd1   (5 cm)
+        6) PICK
+
+    Stage 6 on the robot is the GR00T policy loop (deploy_pick.py drives it through PolicyClient with
+    the governance box). Here it is the deterministic IK grasp -- the point of this clip is the
+    end-to-end sequencing, not the policy.
+    """
+    obj = np.array([*S.CYL_XY, S.TOP + S.CYL_H / 2])
+    log = []
+
+    def hold(n=10):
+        for _ in range(n):
+            io.render()
+
+    # 1) approach: forward, then turn to face the object
+    stand_x = obj[0] - F.PICK_STANDOFF - 0.05
+    log.append("1) base forward")
+    while io.x < stand_x - 0.30 and not F.ESTOP["tripped"]:
+        io.drive(F.V_FWD, 0.0, 1 / 30); io.render()
+    log.append("2) base turn (align to object)")
+    while not F.ESTOP["tripped"]:
+        err = F.wrap(np.arctan2(obj[1] - io.y, obj[0] - io.x) - io.yaw)
+        if abs(err) < F.YAW_TOL:
+            break
+        io.drive(0.0, np.clip(2.0 * err, -F.W_TURN, F.W_TURN), 1 / 30); io.render()
+    hold()
+
+    # 3) arms to the inference start pose (open, pre-grasp standoff)
+    log.append("3) arms -> inference start pose")
+    qL0, qR0, _ = io._solve_grasp(obj, F.GRASP_HALF_W + F.PREGRASP_BACK, back=F.PREGRASP_BACK)
+    for i in range(24):
+        a = i / 23.0
+        io.armL = F.ARM_HOME + (qL0 - F.ARM_HOME) * a
+        io.armR = F.ARM_HOME + (qR0 - F.ARM_HOME) * a
+        io.render()
+
+    # 4) trunk up 3 in -- a real DOF on the wheeled base, a no-op on the legged stand-in
+    log.append("4) trunk up 3 in" if io.kin.q_lift is not None else "4) trunk up (no lift on this model)")
+    target_lift = min(3 * IN, io.kin.lift_max)
+    for i in range(18):
+        io.lift = target_lift * (i / 17.0)
+        io.render()
+
+    # 5) creep forward the last 5 cm
+    log.append("5) base forward 5 cm")
+    x0 = io.x
+    while abs(io.x - x0) < 0.05 and not F.ESTOP["tripped"]:
+        io.drive(F.V_FWD * 0.4, 0.0, 1 / 30); io.render()
+    hold()
+
+    # 6) the pick itself
+    log.append("6) PICK (deterministic stand-in for the policy loop)")
+    io.do_pick()
+    hold(15)
+
+    print("[DEPLOY] " + " -> ".join(s.split(") ")[1] for s in log), flush=True)
+
+    # hand off to the navigation FSM for plan -> accept -> move -> place
+    grid = io.occupancy()
+    N.ROBOT_RADIUS = S.ROBOT_RADIUS
+    path = N.plan(grid, io.get_pose()[:2], place_target)
+    if path is None:
+        print("[DEPLOY] no path to the place target", flush=True)
+        return False
+    print(f"[DEPLOY] planned {len(path)} waypoints -> AUTO-ACCEPT -> MOVE", flush=True)
+    import threading
+    threading.Thread(target=F.safety_monitor, args=(io,), daemon=True).start()
+    for (tx, ty) in [grid.c2w(r, c) for r, c in path][1:]:
+        if F.ESTOP["tripped"]:
+            break
+        F.execute_leg(io, tx, ty)
+    while not F.ESTOP["tripped"]:
+        err = F.wrap(np.pi / 2 - io.yaw)
+        if abs(err) < F.YAW_TOL:
+            break
+        io.drive(0, np.clip(2 * err, -F.W_TURN, F.W_TURN), 1 / 30); io.render()
+    if F.ESTOP["tripped"]:
+        print("[DEPLOY] halted by safety E-STOP -- not placing", flush=True)
+        return False
+    io.do_place()
+    print("[DEPLOY] done", flush=True)
+    return True
+
+
 def run(scenario, out_dir, seed=0):
     intruder = (0.0, 0.95) if scenario == "failsafe" else None
     F.ESTOP["tripped"], F.ESTOP["reason"] = False, ""
@@ -111,7 +210,10 @@ def run(scenario, out_dir, seed=0):
         cam.azimuth = 60
     io = TrackingIO(packages, cam, video_path=mp4, intruder=intruder, look_at_also=intruder)
     try:
-        ok = F.run_fsm(io, S.GOAL, auto=True)
+        if scenario == "deploy":
+            ok = run_deploy_sequence(io, S.GOAL)
+        else:
+            ok = F.run_fsm(io, S.GOAL, auto=True)
     finally:
         io.close()
     tripped = F.ESTOP["tripped"]
@@ -147,7 +249,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(HERE, "..", "docs", "videos"))
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--scenarios", default="nominal,failsafe")
+    ap.add_argument("--scenarios", default="nominal,failsafe,deploy")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     for s in a.scenarios.split(","):

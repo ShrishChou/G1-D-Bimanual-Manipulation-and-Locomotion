@@ -18,16 +18,39 @@ and the only robot asset is the public Unitree G1 model, fetched on demand.
 
 ---
 
-## The pipeline running end to end in the digital twin
+## The full deployment sequence, in the twin
+
+The staged sequence `deploy/deploy_pick.py` runs on the robot, replayed in simulation. Base, trunk and
+arms are three independent channels on hardware (`cmd_vel`, `cmd_hispeed`, the arm controller) and are
+driven in the same order here:
+
+**base forward → turn to face the object → arms to the inference start pose → trunk up 3 in → creep
+forward 5 cm → pick → plan → move → place**
+
+![Full deployment sequence in the twin](docs/videos/twin_deploy.gif)
+
+*[full-resolution mp4](docs/videos/twin_deploy.mp4)*
+
+Stage 6 on the robot is the GR00T policy loop, driven through `PolicyClient` inside the governance box.
+**In this clip it is the deterministic IK grasp instead** — the subject here is the end-to-end
+sequencing and the handoff into navigation, not the policy. The trunk lift is a real DOF on this robot
+(a two-stage prismatic Z-lift), so "trunk up 3 in" actually moves.
+
+## The navigation FSM end to end
 
 The same `run_fsm` loop that ships to the robot, driven against MuJoCo. Pick → plan → accept → move → place:
 
 ![Autonomous mobile pick-and-place in the digital twin](docs/videos/twin_nominal.gif)
 
-*[full-resolution mp4](docs/videos/twin_nominal.mp4) · the blue cylinder is the target object, the white boxes
-are corridor obstacles the planner routes around, and the far table holds the drop container. The robot is the
-**G1 + Dex3** model — 29-DoF body, two 7-DoF dexterous hands — so the two-handed grasp is articulated rather
-than implied.*
+*[full-resolution mp4](docs/videos/twin_nominal.mp4) · the blue cylinder is the target object, the tan boxes
+are corridor obstacles the planner routes around, and the far table holds the drop container.*
+
+> **About the robot in these clips.** They are rendered with the **wheeled G1-D**: AGV base, two-stage
+> prismatic Z-lift, and two 7-DoF Dex3 hands. That model is not public and is **not included in this
+> repository** — see [Honest status](#honest-status). Everything in `sim/` and `nav/` is written against
+> whatever `G1_XML` points at, so a clean clone renders the same three scenarios with the public
+> `g1_29dof_with_hand_rev_1_0` (legged G1 + the same Dex3 hands) instead. The arms, hands and grasp are
+> identical; the base differs.
 
 ### The failsafe, doing its job
 
@@ -177,7 +200,7 @@ sim/                        the digital twin
   scene.py                  procedural MuJoCo scene (G1+Dex3 + tables + cylinder + obstacles) + occupancy
   grasp_ik.py               name-resolved joint tables + bimanual grasp IK
   animate.py                scripted pick→carry→place animation
-  render_demo.py            regenerate every video and figure in this README
+  render_demo.py            regenerate the videos and figures in this README (3 scenarios)
   cylinder_scene.py         minimal Isaac scene (G1 + table + cylinder)
 
 deploy/                     on-robot execution
@@ -225,7 +248,11 @@ python scripts/fetch_g1_assets.py     # public Unitree G1 + Dex3 MJCF + meshes (
 python nav/nav_fsm.py --auto --out /tmp/run.mp4          # end-to-end, writes a video
 python nav/nav_fsm.py --auto --intruder --out /tmp/f.mp4 # demo the LiDAR failsafe
 python nav/nav_planner.py --demo --out /tmp/plan.png     # planner self-test alone
-python sim/render_demo.py                                # regenerate this README's media
+python sim/render_demo.py                                # all three scenarios + the plan figure
+python sim/render_demo.py --scenarios deploy             # just the staged deployment sequence
+
+# render against a different robot (e.g. the wheeled G1-D, if you have it)
+G1_XML=/path/to/g1d_dex3.xml python sim/render_demo.py
 ```
 
 On macOS prefix with `MUJOCO_GL=cgl`; on a headless Linux box use `MUJOCO_GL=egl`.
@@ -258,12 +285,19 @@ Hardware and training add: `unitree_sdk2py` (DDS + `LocoClient`), ROS 2 + Nav2 +
   and the grasp is solved with IK and then held — the fingers close on the object but no contact forces are
   computed, so nothing here says the grasp would be *stable*. The twin proves the *logic and the geometry*,
   not the contact physics.
-- **On the robot model.** The arms and hands are the real configuration: Unitree's
-  `g1_29dof_with_hand_rev_1_0` — 29-DoF body plus two 7-DoF Dex3 hands, with exactly the joint names the
-  deployment code uses. The **bipedal base stands in for the wheeled G1-D**, whose description is not public;
-  only `G1_XML` changes when that asset is available. This model is fetched from
-  [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) rather than vendored, so the repo
-  carries no robot assets of its own.
+- **On the robot model, and why the committed clips are not byte-reproducible.** The videos here were
+  rendered with the internal **wheeled G1-D** (AGV base, two-stage Z-lift, Dex3 hands). That asset is not
+  public and is deliberately **not committed**, so running `sim/render_demo.py` from a clean clone will
+  render the same three scenarios with the public `g1_29dof_with_hand_rev_1_0` — legged base, identical
+  arms and identical Dex3 hands — and the output will differ from the GIFs above below the waist. Nothing
+  in the code is specific to either: `sim/scene.py` reads `G1_XML`, resolves every joint by name, adds a
+  floating base if the asset has a fixed one, derives the stand height from the geometry, and drives the
+  wheels and Z-lift only if that robot has them. The public model is fetched from
+  [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) rather than vendored, so this
+  repository carries no robot assets of its own.
+- **The work surface is 0.90 m** because the reach envelope of both robots was measured rather than
+  assumed. The G1-D cannot bring its palms much below ~0.92 m with its lift extended, so a standard
+  0.74 m bench is physically unreachable for it; 0.90 m is comfortable for both.
 - **Hardware-gated:** `real_io.py` carries `TODO(robot)` markers on the odometry topic name, the LiDAR
   `PointCloud2` field layout, and the LiDAR→base mount transform. Those are commissioning items, not solved
   problems.
