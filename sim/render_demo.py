@@ -31,16 +31,45 @@ import scene as S            # noqa: E402
 
 
 def demo_camera():
-    """Closer three-quarter view than the FSM's default debug camera, framed on the corridor."""
+    """Closer three-quarter view than the FSM's default debug camera.
+
+    Azimuth 150 is chosen so the front table does not occlude the grasp -- the two hands closing on the
+    cylinder are the thing worth seeing, and from the FSM's default angle the table is in the way.
+    """
     cam = mujoco.MjvCamera()
-    cam.lookat[:] = [0.15, 0.85, 0.55]
-    cam.distance = 3.9
-    cam.azimuth = 208
-    cam.elevation = -22
+    cam.lookat[:] = [0.5, 0.0, 0.85]
+    cam.distance = 2.9
+    cam.azimuth = 150
+    cam.elevation = -16
     return cam
 
 
-def to_gif(mp4, gif, width=480, fps=12, speed=1.7, max_seconds=None):
+class TrackingIO(F.SimIO):
+    """SimIO with a camera that follows the base, so the robot stays framed from the pick at the front
+    table through the traverse to the place. Presentation only -- no behaviour is overridden.
+
+    `look_at_also` pulls the framing toward a second world point. The failsafe run needs it: the whole
+    point of that clip is the robot stopping short of an obstacle, which is useless if the obstacle is
+    off-screen behind the robot.
+    """
+
+    LOOK_OFFSET = np.array([0.18, 0.10, 0.85])   # look slightly ahead of the base, at chest height
+    SMOOTH = 0.12                                # lerp factor: kills per-frame jitter
+
+    def __init__(self, *a, look_at_also=None, **kw):
+        super().__init__(*a, **kw)
+        self.look_at_also = np.array([*look_at_also, 0.30]) if look_at_also is not None else None
+
+    def render(self):
+        target = np.array([self.x, self.y, 0.0]) + self.LOOK_OFFSET
+        if self.look_at_also is not None:
+            target = 0.5 * (target + self.look_at_also)
+        cur = np.array(self.cam.lookat)
+        self.cam.lookat[:] = cur + (target - cur) * self.SMOOTH
+        return super().render()
+
+
+def to_gif(mp4, gif, width=460, fps=12, speed=2.6, max_seconds=None):
     """Small looping GIF for inline README display.
 
     GitHub will not play an mp4 that is committed to the repo, so the READMEs embed a GIF and link the
@@ -74,7 +103,13 @@ def run(scenario, out_dir, seed=0):
     rng = np.random.default_rng(seed)
     packages = S.random_packages(rng)
     mp4 = os.path.join(out_dir, f"twin_{scenario}.mp4")
-    io = F.SimIO(packages, demo_camera(), video_path=mp4, intruder=intruder)
+    cam = demo_camera()
+    if intruder is not None:
+        # look up the corridor instead of across it, so the robot, the cylinder it is carrying and the
+        # unplanned obstacle it stops short of are all in one shot
+        cam.distance = 3.2
+        cam.azimuth = 60
+    io = TrackingIO(packages, cam, video_path=mp4, intruder=intruder, look_at_also=intruder)
     try:
         ok = F.run_fsm(io, S.GOAL, auto=True)
     finally:

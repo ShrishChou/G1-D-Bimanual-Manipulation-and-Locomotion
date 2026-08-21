@@ -16,8 +16,16 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scene as S
 
-RIGHT_ARM = slice(29, 36)
-LEFT_ARM = slice(22, 29)
+# resolved per-model by name -- see sim/grasp_ik.py (this model interleaves arm, hand, arm, hand)
+_KIN = None
+
+
+def _kin(model):
+    global _KIN
+    if _KIN is None or _KIN.m is not model:
+        from grasp_ik import Kin
+        _KIN = Kin(model)
+    return _KIN
 HAND_BODY = "right_wrist_yaw_link"
 ARM_HOME = np.zeros(7)
 ARM_REACH_R = np.array([-0.55, -0.20, 0.0, 1.05, 0, 0, 0])   # shoulder fwd + elbow bend -> hand in front
@@ -39,8 +47,9 @@ def smooth(t):
 def set_robot(d, base_xy, yaw, armL, armR):
     d.qpos[0:3] = [base_xy[0], base_xy[1], 0.793]
     d.qpos[3:7] = yaw_quat(yaw)
-    d.qpos[LEFT_ARM] = armL
-    d.qpos[RIGHT_ARM] = armR
+    k = _kin(m)
+    d.qpos[k.q_armL] = armL
+    d.qpos[k.q_armR] = armR
 
 
 def set_cylinder(d, gadr, pos, quat=S.CYL_STAND_QUAT):

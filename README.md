@@ -25,7 +25,9 @@ The same `run_fsm` loop that ships to the robot, driven against MuJoCo. Pick →
 ![Autonomous mobile pick-and-place in the digital twin](docs/videos/twin_nominal.gif)
 
 *[full-resolution mp4](docs/videos/twin_nominal.mp4) · the blue cylinder is the target object, the white boxes
-are corridor obstacles the planner routes around, and the far table holds the drop container*
+are corridor obstacles the planner routes around, and the far table holds the drop container. The robot is the
+**G1 + Dex3** model — 29-DoF body, two 7-DoF dexterous hands — so the two-handed grasp is articulated rather
+than implied.*
 
 ### The failsafe, doing its job
 
@@ -87,6 +89,27 @@ PICK ──▶ PLAN ──▶ [HUMAN ACCEPT] ──▶ MOVE ──▶ PLACE
 - **The failsafe watches the map-vs-scan difference, not the raw scan.** The planner already keeps clearance
   from known obstacles, so tripping on those would make the robot stop constantly. Only points that were *not*
   in the planned map are treated as intrusions.
+
+### The two-handed grasp
+
+The object is carried **between both palms**, not hanging off one hand, because that is how the taught skill and
+the policy both do it — a 45 mm-radius cylinder is a two-handed object for this robot.
+
+`sim/grasp_ik.py` solves it: damped-least-squares IK on each arm's 7 joints, targeting palm points on opposite
+sides of the object, with a nullspace pull toward a natural carry posture. The object then rides the **midpoint
+of the two palms** for the rest of the run. Palm residual on the shipped scene is under 1 mm.
+
+Two details that took measuring rather than guessing:
+
+- **The Jacobian has to be taken at the palm point, not the wrist body origin.** `mj_jacBody` linearises the
+  body frame, and with a 60 mm palm offset that stalls the solve about 40 mm short of the target — close enough
+  to look like a tuning problem and not be one.
+- **The arm can only reach ~0.35 m forward at table height.** Sampling 40k random arm configurations puts the
+  maximum palm distance at 0.469 m from the shoulder, and 0.346 m forward inside the grasp band. So the base
+  drives to a standoff first instead of over-reaching — which is also what the real approach sequence does.
+
+Joint indices are resolved **by name** throughout. The G1-D model orders joints arm, hand, arm, hand, so a
+qpos slice that is correct for the hand-less model writes finger angles into the wrong place — silently.
 
 ### Cartesian governance on the policy
 
@@ -151,7 +174,8 @@ nav/                        navigation and supervised autonomy
   nav2/                     ROS 2 Nav2 launch, params and map relay
 
 sim/                        the digital twin
-  scene.py                  procedural MuJoCo scene (G1 + tables + cylinder + obstacles) + occupancy export
+  scene.py                  procedural MuJoCo scene (G1+Dex3 + tables + cylinder + obstacles) + occupancy
+  grasp_ik.py               name-resolved joint tables + bimanual grasp IK
   animate.py                scripted pick→carry→place animation
   render_demo.py            regenerate every video and figure in this README
   cylinder_scene.py         minimal Isaac scene (G1 + table + cylinder)
@@ -192,7 +216,7 @@ between light-move and locked-hold, and a one-time gravity calibration that neve
 
 ```bash
 pip install -r requirements.txt
-python scripts/fetch_g1_assets.py     # public Unitree G1 MJCF + meshes (~36 MB, once)
+python scripts/fetch_g1_assets.py     # public Unitree G1 + Dex3 MJCF + meshes (~36 MB, once)
 ```
 
 **Run the whole pipeline in the twin — no GPU, no robot, no checkpoint:**
@@ -231,9 +255,15 @@ Hardware and training add: `unitree_sdk2py` (DDS + `LocoClient`), ROS 2 + Nav2 +
   gate, the map-vs-scan failsafe, and the Ctrl-C killswitch. Both videos above are real runs of the shipped
   code — reproduce them with one command.
 - **Approximated in the twin:** the base is integrated kinematically rather than simulated with wheel dynamics,
-  and `SimIO`'s pick/place are scripted arm interpolations. The twin proves the *logic*, not the contact
-  physics. The robot is also the public bipedal G1 standing in for the wheeled G1-D, since that asset is not
-  public — only `G1_XML` and the base/arm joint indices differ.
+  and the grasp is solved with IK and then held — the fingers close on the object but no contact forces are
+  computed, so nothing here says the grasp would be *stable*. The twin proves the *logic and the geometry*,
+  not the contact physics.
+- **On the robot model.** The arms and hands are the real configuration: Unitree's
+  `g1_29dof_with_hand_rev_1_0` — 29-DoF body plus two 7-DoF Dex3 hands, with exactly the joint names the
+  deployment code uses. The **bipedal base stands in for the wheeled G1-D**, whose description is not public;
+  only `G1_XML` changes when that asset is available. This model is fetched from
+  [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) rather than vendored, so the repo
+  carries no robot assets of its own.
 - **Hardware-gated:** `real_io.py` carries `TODO(robot)` markers on the odometry topic name, the LiDAR
   `PointCloud2` field layout, and the LiDAR→base mount transform. Those are commissioning items, not solved
   problems.

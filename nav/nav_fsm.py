@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sim"))
 import nav_planner as N
 import scene as S
+from grasp_ik import CLOSED, OPEN, Kin
 
 # ---- slow, controlled motion limits (shared sim + real) ----
 V_FWD = 0.15          # m/s straight-drive cap
@@ -35,8 +36,12 @@ YAW_TOL = 0.05        # rad heading tolerance before driving
 DANGER_R = 0.45       # m: an obstacle point closer than this in the front sector -> E-STOP
 FRONT_DEG = 60        # +/- half-angle of the front danger sector
 ARM_HOME = np.zeros(7)
-ARM_REACH_R = np.array([-0.55, -0.20, 0.0, 1.05, 0, 0, 0])
-ARM_REACH_L = np.array([-0.55, 0.20, 0.0, 1.05, 0, 0, 0])
+# Bimanual grasp geometry. The arm can only reach ~0.35 m forward at table height (measured on the
+# model, not assumed), so the base drives to a standoff first instead of over-reaching.
+PICK_STANDOFF = 0.30       # m: pelvis-to-object distance for the grasp
+PREGRASP_BACK = 0.13       # m: hands start this far behind the object, and this much wider
+GRASP_HALF_W = 0.085       # m: palm offset either side of a 45 mm-radius cylinder
+LIFT_H = 0.12              # m: how far the object is lifted off the table
 ESTOP = {"tripped": False, "reason": ""}
 ACTIVE_IO = None      # set to the live RobotIO so the Ctrl-C handler can stop the base from anywhere
 
@@ -77,7 +82,9 @@ class SimIO:
         self.d = mujoco.MjData(self.model)
         self.gadr = info["cyl_qadr"]
         self.x, self.y, self.yaw = 0.0, 0.0, 0.0
+        self.kin = Kin(self.model)
         self.armL, self.armR = ARM_HOME.copy(), ARM_HOME.copy()
+        self.handL, self.handR = OPEN.copy(), OPEN.copy()
         self.cylinder = [*S.CYL_XY, S.TOP, *S.CYL_STAND_QUAT]
         self.carry = False
         self.r = mujoco.Renderer(self.model, height=720, width=1280)
@@ -122,17 +129,25 @@ class SimIO:
     def stop(self):
         pass
 
-    def _hand_pos(self):
-        return np.array(self.d.body("right_wrist_yaw_link").xpos)
+    def _grasp_center(self):
+        """Where a two-handed object actually sits: the midpoint between the two palms."""
+        return self.kin.grasp_center(self.d)
+
+    def _solve_grasp(self, center, half_width, back=0.0):
+        """IK both arms onto a symmetric grasp about `center`, in the base frame."""
+        c = np.array(center, float)
+        c = c - back * np.array([np.cos(self.yaw), np.sin(self.yaw), 0.0])
+        qL, qR, err = self.kin.ik_bimanual(self.d, c, half_width=half_width)
+        return qL, qR, err
 
     def render(self):
         self.d.qpos[0:3] = [self.x, self.y, 0.793]
         self.d.qpos[3:7] = yaw_quat(self.yaw)
-        self.d.qpos[22:29] = self.armL; self.d.qpos[29:36] = self.armR
+        self.kin.apply(self.d, self.armL, self.armR, self.handL, self.handR)
         mujoco.mj_forward(self.model, self.d)
         if self.carry:
-            h = self._hand_pos()
-            self.d.qpos[self.gadr:self.gadr + 3] = [h[0], h[1], h[2] - S.CYL_H / 2]
+            # the object is held BETWEEN the hands, so it rides the palm midpoint
+            self.d.qpos[self.gadr:self.gadr + 3] = self._grasp_center()
             self.d.qpos[self.gadr + 3:self.gadr + 7] = S.CYL_STAND_QUAT
         else:
             self.d.qpos[self.gadr:self.gadr + 7] = self.cylinder
@@ -153,24 +168,68 @@ class SimIO:
         return S.occupancy(self.packages)
 
     def do_pick(self):
-        for i in range(26):
-            t = i / 25.0
-            self.armL = ARM_HOME + (ARM_REACH_L - ARM_HOME) * t
-            self.armR = ARM_HOME + (ARM_REACH_R - ARM_HOME) * t
+        """Approach, reach, close two hands around the object, and lift it.
+
+        On the robot this whole phase is a taught deterministic skill (deploy/run_skill.py) or the VLA
+        policy (deploy/deploy_pick.py); here it is solved kinematically so the twin shows the same
+        two-handed geometry rather than a hand snapping to the object.
+        """
+        obj = np.array([*S.CYL_XY, S.TOP + S.CYL_H / 2])
+
+        # 1) drive to a standoff where the grasp is actually inside the arm workspace
+        stand_x = obj[0] - PICK_STANDOFF
+        while self.x < stand_x - 0.01 and not ESTOP["tripped"]:
+            self.drive(V_FWD, -np.clip(2.0 * wrap(0.0 - self.yaw), -W_TURN, W_TURN), 1 / 30)
             self.render()
-        for _ in range(16):
+
+        # 2) pre-grasp: hands open, apart and behind the object
+        qL0, qR0, _ = self._solve_grasp(obj, GRASP_HALF_W + PREGRASP_BACK, back=PREGRASP_BACK)
+        for i in range(24):
+            a = i / 23.0
+            self.armL, self.armR = ARM_HOME + (qL0 - ARM_HOME) * a, ARM_HOME + (qR0 - ARM_HOME) * a
             self.render()
+
+        # 3) converge: bring both palms in to the object's sides
+        qL1, qR1, err = self._solve_grasp(obj, GRASP_HALF_W)
+        for i in range(20):
+            a = i / 19.0
+            self.armL, self.armR = qL0 + (qL1 - qL0) * a, qR0 + (qR1 - qR0) * a
+            self.render()
+
+        # 4) close the fingers
+        for i in range(12):
+            a = i / 11.0
+            self.handL = self.handR = OPEN + (CLOSED - OPEN) * a
+            self.render()
+
+        # 5) lift -- the object is now held between the palms
         self.carry = True
+        qL2, qR2, _ = self._solve_grasp(obj + np.array([0, 0, LIFT_H]), GRASP_HALF_W)
+        for i in range(18):
+            a = i / 17.0
+            self.armL, self.armR = qL1 + (qL2 - qL1) * a, qR1 + (qR2 - qR1) * a
+            self.render()
+        print(f"[PICK] two-handed grasp: palm IK residual {err*1000:.0f} mm, "
+              f"object at {np.round(self._grasp_center(), 3)}", flush=True)
 
     def do_place(self):
-        self.cylinder = [S.CONT_XY[0], S.CONT_XY[1], S.TOP + S.STAND_H, *S.CYL_STAND_QUAT]
-        for _ in range(18):
+        """Lower the object into the container, open both hands, and withdraw."""
+        drop = np.array([S.CONT_XY[0], S.CONT_XY[1], S.TOP + S.STAND_H + S.CYL_H / 2])
+        qL_hold, qR_hold = self.armL.copy(), self.armR.copy()
+        qL_dn, qR_dn, _ = self._solve_grasp(drop, GRASP_HALF_W)
+        for i in range(20):                      # lower into the hole
+            a = i / 19.0
+            self.armL, self.armR = qL_hold + (qL_dn - qL_hold) * a, qR_hold + (qR_dn - qR_hold) * a
+            self.render()
+        for i in range(10):                      # release
+            a = i / 9.0
+            self.handL = self.handR = CLOSED + (OPEN - CLOSED) * a
             self.render()
         self.carry = False
-        for i in range(16):
-            t = i / 15.0
-            self.armL = ARM_REACH_L + (ARM_HOME - ARM_REACH_L) * t
-            self.armR = ARM_REACH_R + (ARM_HOME - ARM_REACH_R) * t
+        self.cylinder = [drop[0], drop[1], S.TOP + S.STAND_H + S.CYL_H / 2, *S.CYL_STAND_QUAT]
+        for i in range(18):                      # withdraw to home
+            a = i / 17.0
+            self.armL, self.armR = qL_dn + (ARM_HOME - qL_dn) * a, qR_dn + (ARM_HOME - qR_dn) * a
             self.render()
 
 

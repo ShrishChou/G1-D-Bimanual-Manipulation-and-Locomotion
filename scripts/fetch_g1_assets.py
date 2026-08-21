@@ -5,8 +5,10 @@
 
 The robot model is NOT vendored in this repository. It is pulled from Google DeepMind's
 MuJoCo Menagerie (BSD-3, see the LICENSE placed alongside the downloaded files) into
-``assets/g1/``, which is where ``sim/scene.py`` looks by default. Set ``G1_XML`` to
-override with your own copy (for example the wheeled G1-D model, which is not public).
+``assets/g1/``. ``sim/scene.py`` defaults to ``g1_with_hands.xml`` -- Unitree's
+``g1_29dof_with_hand_rev_1_0``, the 29-DoF body + 2x7-DoF Dex3 hand configuration the real
+G1-D carries, so the two-handed grasp is articulated. Set ``G1_XML`` to override with your
+own copy (for example the wheeled G1-D base, which is not public).
 
 Downloads ~42 MB of STL meshes on first run and is a no-op afterwards.
 """
@@ -60,7 +62,7 @@ def get(url: str, out: Path) -> None:
 
 def main() -> int:
     print(f"fetching the public Unitree G1 model into {DEST} ...")
-    for name in ("g1.xml", "LICENSE"):
+    for name in ("g1_with_hands.xml", "g1.xml", "LICENSE"):
         get(f"{RAW}/{name}", DEST / name)
 
     try:
@@ -74,7 +76,7 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda a: get(*a), meshes))
 
-    xml = DEST / "g1.xml"
+    xml = DEST / "g1_with_hands.xml"
     if not xml.exists():
         print(f"g1.xml missing at {xml}", file=sys.stderr)
         return 1

@@ -1,7 +1,10 @@
 """Mobile pick-place scene for the G1 in MuJoCo -- the digital twin the autonomy FSM is validated in.
 
-The robot is the public 29-DoF bipedal G1 standing in for the wheeled G1-D: the FSM drives a kinematic
-non-holonomic base, so only ``G1_XML`` and the base/arm qpos indices change when the wheeled asset is used.
+The robot is the public Unitree **G1 + Dex3** model (``g1_29dof_with_hand_rev_1_0``) -- the same 29-DoF
+body and 2x7-DoF dexterous hands the real G1-D carries, so the two-handed grasp is articulated rather
+than implied. The bipedal base stands in for the wheeled one: the FSM drives a kinematic non-holonomic
+base, so only ``G1_XML`` changes when the wheeled asset is available. All joint indices are resolved by
+NAME (see ``sim/grasp_ik.py``), because this model interleaves each hand after its own arm.
 
 Layout: a front table carrying the target object -- a plain upright cylinder (45 mm radius, 182 mm tall),
 the neutral stand-in used throughout this repo -- 5 in from the near edge; a place table 2 m to the left
@@ -23,8 +26,10 @@ import nav_planner as N
 
 IN = 0.0254
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Public Unitree G1 MJCF. Fetch once with scripts/fetch_g1_assets.py, or point G1_XML at your own copy.
-G1_XML = os.environ.get("G1_XML", os.path.join(HERE, "..", "assets", "g1", "g1.xml"))
+# Unitree G1 with Dex3 hands -- "g1_29dof_with_hand_rev_1_0", the 29-DoF body + 2x7-DoF hand
+# configuration this project runs on. Fetch once with scripts/fetch_g1_assets.py, or set G1_XML
+# to your own copy (e.g. the wheeled G1-D base, which is not public).
+G1_XML = os.environ.get("G1_XML", os.path.join(HERE, "..", "assets", "g1", "g1_with_hands.xml"))
 CONTAINER_OBJ = os.path.join(HERE, "assets", "container.obj")
 
 TOP = 0.74
