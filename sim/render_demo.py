@@ -69,7 +69,7 @@ class TrackingIO(F.SimIO):
         return super().render()
 
 
-def to_gif(mp4, gif, width=460, fps=12, speed=2.6, max_seconds=None):
+def to_gif(mp4, gif, width=440, fps=12, speed=4.0, max_seconds=None):
     """Small looping GIF for inline README display.
 
     GitHub will not play an mp4 that is committed to the repo, so the READMEs embed a GIF and link the
@@ -170,6 +170,7 @@ def run_deploy_sequence(io, place_target):
     print("[DEPLOY] " + " -> ".join(s.split(") ")[1] for s in log), flush=True)
 
     # hand off to the navigation FSM for plan -> accept -> move -> place
+    F.back_off(io)
     grid = io.occupancy()
     N.ROBOT_RADIUS = S.ROBOT_RADIUS
     path = N.plan(grid, io.get_pose()[:2], place_target)
@@ -191,6 +192,7 @@ def run_deploy_sequence(io, place_target):
     if F.ESTOP["tripped"]:
         print("[DEPLOY] halted by safety E-STOP -- not placing", flush=True)
         return False
+    F.dock_to_table(io, S.PLACE_NEAR_EDGE)
     io.do_place()
     print("[DEPLOY] done", flush=True)
     return True

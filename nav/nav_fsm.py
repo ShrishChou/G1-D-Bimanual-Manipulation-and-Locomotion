@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sim"))
 import nav_planner as N
 import scene as S
-from grasp_ik import CLOSED, OPEN, Kin
+from grasp_ik import OPEN, Kin
 
 # ---- slow, controlled motion limits (shared sim + real) ----
 V_FWD = 0.15          # m/s straight-drive cap
@@ -38,7 +38,8 @@ FRONT_DEG = 60        # +/- half-angle of the front danger sector
 ARM_HOME = np.zeros(7)
 # Bimanual grasp geometry. The arm can only reach ~0.35 m forward at table height (measured on the
 # model, not assumed), so the base drives to a standoff first instead of over-reaching.
-PICK_STANDOFF = 0.28       # m: base-to-object distance (inside both robots' envelopes)
+PICK_STANDOFF = 0.28       # m: nominal base-to-object distance (clamped so the base clears the table)
+PLACE_CLEAR = 0.06         # m: how far above the container rim the object is released
 PREGRASP_BACK = 0.13       # m: hands start this far behind the object, and this much wider
 GRASP_HALF_W = 0.085       # m: palm offset either side of a 45 mm-radius cylinder
 LIFT_H = 0.12              # m: how far the object is lifted off the table
@@ -88,6 +89,8 @@ class SimIO:
         self.odo = 0.0                 # distance travelled, for rolling the wheels
         self.armL, self.armR = ARM_HOME.copy(), ARM_HOME.copy()
         self.handL, self.handR = OPEN.copy(), OPEN.copy()
+        self.cyl_geoms = [g for g in range(self.model.ngeom)
+                          if self.model.geom_bodyid[g] == self.model.body("cylinder").id]
         self.cylinder = [*S.CYL_XY, S.TOP, *S.CYL_STAND_QUAT]
         self.carry = False
         self.r = mujoco.Renderer(self.model, height=720, width=1280)
@@ -140,8 +143,10 @@ class SimIO:
     def _solve_grasp(self, center, half_width, back=0.0):
         """IK both arms onto a symmetric grasp about `center`, in the base frame."""
         c = np.array(center, float)
-        c = c - back * np.array([np.cos(self.yaw), np.sin(self.yaw), 0.0])
-        qL, qR, err = self.kin.ik_bimanual(self.d, c, half_width=half_width)
+        fwd = np.array([np.cos(self.yaw), np.sin(self.yaw), 0.0])
+        left = np.array([-np.sin(self.yaw), np.cos(self.yaw), 0.0])
+        c = c - back * fwd
+        qL, qR, err = self.kin.ik_bimanual(self.d, c, half_width=half_width, lateral=left)
         return qL, qR, err
 
     def render(self):
@@ -182,12 +187,16 @@ class SimIO:
         """
         obj = np.array([*S.CYL_XY, S.TOP + S.CYL_H / 2])
 
-        # 1) close to a standoff where the grasp is inside the arm workspace. Measured as a DISTANCE
-        # along the current heading, not a world-x threshold -- the caller may already have turned to
-        # face the object (the staged deployment sequence does exactly that).
+        # 1) close to a standoff where the grasp is inside the arm workspace, but never closer than
+        # the table allows. The base is a disc of radius S.ROBOT_RADIUS and the table face is solid, so
+        # driving to a fixed object-relative standoff put the chassis inside the table -- which is
+        # exactly what "the base phases through the table" looked like.
+        table_limit = float(np.hypot(obj[0] - (S.FRONT_NEAR_EDGE - S.DOCK_HALF - 0.02),
+                                     obj[1] - self.y))
+        standoff = max(PICK_STANDOFF, table_limit)
         while not ESTOP["tripped"]:
             d_obj = float(np.hypot(obj[0] - self.x, obj[1] - self.y))
-            if d_obj <= PICK_STANDOFF + 0.01:
+            if d_obj <= standoff + 0.01:
                 break
             err = wrap(np.arctan2(obj[1] - self.y, obj[0] - self.x) - self.yaw)
             self.drive(V_FWD * max(0.25, 1 - abs(err)), np.clip(1.5 * err, -W_TURN, W_TURN), 1 / 30)
@@ -208,11 +217,23 @@ class SimIO:
             self.armL, self.armR = qL0 + (qL1 - qL0) * a, qR0 + (qR1 - qR0) * a
             self.render()
 
-        # 4) close the fingers
+        # 4) close the fingers until they actually touch the cylinder. The stopping point is found by
+        # bisecting against MuJoCo's contact detection, so the fingers land on the surface of whatever
+        # radius the object has instead of driving through it at a hand-tuned angle.
+        def _pose_hands(frac):
+            self.handL = self.kin.closed_pose("L", frac)
+            self.handR = self.kin.closed_pose("R", frac)
+            self.kin.apply(self.d, self.armL, self.armR, self.handL, self.handR)
+            self.d.qpos[self.gadr:self.gadr + 3] = self.kin.grasp_center(self.d)
+            mujoco.mj_forward(self.model, self.d)
+
+        grip = self.kin.close_on_object(self.d, self.cyl_geoms, _pose_hands)
         for i in range(12):
-            a = i / 11.0
-            self.handL = self.handR = OPEN + (CLOSED - OPEN) * a
+            a = (i / 11.0) * grip
+            self.handL = self.kin.closed_pose("L", a)
+            self.handR = self.kin.closed_pose("R", a)
             self.render()
+        self.grip = grip
 
         # 5) lift -- the object is now held between the palms
         self.carry = True
@@ -225,24 +246,50 @@ class SimIO:
               f"object at {np.round(self._grasp_center(), 3)}", flush=True)
 
     def do_place(self):
-        """Lower the object into the container, open both hands, and withdraw."""
-        drop = np.array([S.CONT_XY[0], S.CONT_XY[1], S.TOP + S.STAND_H + S.CYL_H / 2])
+        """Carry the object over the container's hole, release it, and let it drop through.
+
+        Deliberately NOT a downward move into the plate: the object is centred above the rim, the
+        hands open, and only then does it fall. Setting it down through the container was the other
+        half of the "everything phases through everything" look.
+        """
+        rim_z = S.TOP + S.STAND_H + 0.5 * S.IN          # top face of the container plate
+        above = np.array([S.CONT_XY[0], S.CONT_XY[1], rim_z + S.CYL_H / 2 + PLACE_CLEAR])
+        rest = np.array([S.CONT_XY[0], S.CONT_XY[1], S.TOP + S.CYL_H / 2])   # stands on the table,
+        #                                                                      protruding through the hole
         qL_hold, qR_hold = self.armL.copy(), self.armR.copy()
-        qL_dn, qR_dn, _ = self._solve_grasp(drop, GRASP_HALF_W)
-        for i in range(20):                      # lower into the hole
-            a = i / 19.0
-            self.armL, self.armR = qL_hold + (qL_dn - qL_hold) * a, qR_hold + (qR_dn - qR_hold) * a
+
+        qL_up, qR_up, err = self._solve_grasp(above, GRASP_HALF_W)
+        for i in range(22):                      # traverse to directly over the hole
+            a = i / 21.0
+            self.armL, self.armR = qL_hold + (qL_up - qL_hold) * a, qR_hold + (qR_up - qR_hold) * a
             self.render()
-        for i in range(10):                      # release
-            a = i / 9.0
-            self.handL = self.handR = CLOSED + (OPEN - CLOSED) * a
+        for _ in range(8):
             self.render()
+
+        grip = getattr(self, "grip", 1.0)
+        for i in range(10):                      # open the hands -- the object is still held by them
+            a = 1.0 - i / 9.0
+            self.handL = self.kin.closed_pose("L", grip * a)
+            self.handR = self.kin.closed_pose("R", grip * a)
+            self.render()
+
+        # released: fall from where it was let go down into the hole
         self.carry = False
-        self.cylinder = [drop[0], drop[1], S.TOP + S.STAND_H + S.CYL_H / 2, *S.CYL_STAND_QUAT]
+        drop_from = self.kin.grasp_center(self.d).copy()
+        for i in range(14):
+            a = (i + 1) / 14.0
+            z = drop_from[2] + (rest[2] - drop_from[2]) * (a * a)   # quadratic: gravity, not a lerp
+            self.cylinder = [rest[0], rest[1], float(z), *S.CYL_STAND_QUAT]
+            self.render()
+        self.cylinder = [rest[0], rest[1], float(rest[2]), *S.CYL_STAND_QUAT]
+
         for i in range(18):                      # withdraw to home
             a = i / 17.0
-            self.armL, self.armR = qL_dn + (ARM_HOME - qL_dn) * a, qR_dn + (ARM_HOME - qR_dn) * a
+            self.armL, self.armR = qL_up + (ARM_HOME - qL_up) * a, qR_up + (ARM_HOME - qR_up) * a
             self.render()
+        print(f"[PLACE] hold-above IK residual {err * 1000:.0f} mm; released "
+              f"{PLACE_CLEAR * 100:.0f} cm above the rim; object settled at {np.round(rest, 3)}",
+              flush=True)
 
 
 def safety_check(io):
@@ -288,10 +335,46 @@ def execute_leg(io, tx, ty, dt=1 / 30, render=True):
     io.drive(0, 0, dt)
 
 
+def dock_to_table(io, near_edge_y, dt=1 / 30):
+    """Creep straight forward until the base is one DOCK_HALF off the table face.
+
+    A* plans to a pose outside the table inflated by the TURNING radius, which parks the base ~10 cm
+    further out than it can actually stand -- far enough to put the container beyond arm reach. The
+    base does not rotate during this last stretch, so it is closed with the shallower half-depth,
+    the same split nav/table_align.py makes on the robot.
+    """
+    target = near_edge_y - S.DOCK_HALF - 0.02
+    while not ESTOP["tripped"]:
+        if io.y >= target - 0.01:
+            break
+        err = wrap(np.pi / 2 - io.yaw)
+        io.drive(V_FWD * 0.5, np.clip(1.5 * err, -W_TURN, W_TURN), dt)
+        io.render()
+    io.drive(0, 0, dt)
+
+
+def back_off(io, distance=0.30, dt=1 / 30):
+    """Reverse straight by `distance` before planning.
+
+    Docking deliberately parks the base inside the region A* treats as blocked -- the planner inflates
+    by the turning radius, the dock uses the shallower half-depth. Planning from there fails on the
+    START cell, so the robot backs out of the table's swept zone first, which is what it would have to
+    do on hardware before turning anyway.
+    """
+    x0, y0 = io.x, io.y
+    while not ESTOP["tripped"]:
+        if float(np.hypot(io.x - x0, io.y - y0)) >= distance:
+            break
+        io.drive(-V_FWD * 0.6, 0.0, dt)
+        io.render()
+    io.drive(0, 0, dt)
+
+
 def run_fsm(io, place_target, auto=True):
     print("[FSM] PICK (deterministic)", flush=True)
     io.do_pick()
 
+    back_off(io)
     print("[FSM] PLAN", flush=True)
     grid = io.occupancy()
     N.ROBOT_RADIUS = S.ROBOT_RADIUS
@@ -325,6 +408,7 @@ def run_fsm(io, place_target, auto=True):
 
     if ESTOP["tripped"]:
         print("[FSM] halted by safety E-STOP -- not placing"); return False
+    dock_to_table(io, S.PLACE_NEAR_EDGE)
     print("[FSM] PLACE (deterministic)", flush=True)
     io.do_place()
     print("[FSM] done", flush=True)

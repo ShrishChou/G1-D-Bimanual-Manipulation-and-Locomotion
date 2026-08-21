@@ -42,13 +42,33 @@ STAND_H = 4 * IN
 CYL_R, CYL_H = 0.045, 0.1822                     # target object: upright cylinder
 CYL_STAND_QUAT = [1, 0, 0, 0]                    # a MuJoCo cylinder primitive is already +z
 FRONT_TBL = (1.0, 0.0)
-PLACE_TBL = (0.0, 2.0)
-CYL_XY = (0.7 + 5 * IN, 0.0)                    # 5in from the front table's near edge
-CONT_XY = (0.0, 1.7 + 7 * IN)                    # 7in from the place table's robot-facing edge
-GOAL = (0.0, CONT_XY[1] - 0.55)                  # robot drop stance: centered on the drop, ~0.55 m out
+PLACE_TBL = (0.0, 3.0)   # far enough that a base of this width can actually route around
+#                          an obstacle: inflating a centre box by the real 0.43 m radius
+#                          spans ~1.2 m of corridor, which swallowed the old 2.0 m layout
+TBL_HALF = (0.45, 0.30)                          # half-extents before the 90 deg rotation
+FRONT_NEAR_EDGE = FRONT_TBL[0] - TBL_HALF[1]     # x of the table face the robot approaches
+PLACE_NEAR_EDGE = PLACE_TBL[1] - TBL_HALF[1]     # y of the place table's near face
+CYL_XY = (0.7 + 3 * IN, 0.0)                    # 3in in from the near edge, so a docked
+#                                                 base can still reach it
+CONT_XY = (PLACE_TBL[0], PLACE_NEAR_EDGE + 5 * IN)   # 5in in from the near edge, so a
+#                                                      docked base can still reach it
+GOAL = (0.0, 1.25)                               # recomputed by _init_robot() for this robot
 START = (0.0, 0.0)
 PKG = [11 * IN / 2, 7 * IN / 2, 5 * IN / 2]
-ROBOT_RADIUS = 0.18
+# Planning radius for the mobile base. Derived from the robot's own chassis footprint (see
+# base_footprint_radius) rather than guessed: the wheeled G1-D circumscribes at 0.273 m, so the old
+# hand-picked 0.18 under-inflated every obstacle by ~9 cm and the planner happily routed the base
+# straight through the corridor boxes.
+# Two different sizes, because a mobile base has two of them:
+#   ROBOT_RADIUS  circumscribed (half-diagonal) -- the disc swept when turning in place, so this is
+#                 what obstacle inflation and A* must use.
+#   DOCK_HALF     half-DEPTH along the approach -- the base drives straight at a table face and does
+#                 not rotate there, so clamping the dock distance to the turning circle would hold it
+#                 ~10 cm further out than it can actually stand, putting the object out of reach.
+BASE_MARGIN = 0.05
+DOCK_MARGIN = 0.03
+ROBOT_RADIUS = 0.18            # both replaced by _init_robot() once the robot is known
+DOCK_HALF = 0.18
 
 
 _ROBOT_XML = None      # resolved once by _init_robot()
@@ -119,12 +139,49 @@ def base_stand_height(xml_path):
     return float(model.qpos0[2] - lo)
 
 
+def base_footprint(xml_path, below=0.55):
+    """(circumscribed radius, half-depth) of the robot's chassis, from geometry below `below` metres.
+
+    Only the base matters here -- the arms are folded in while driving -- so geoms above the cut are
+    ignored. Measured from AABB corners, like base_stand_height.
+    """
+    model = mujoco.MjSpec.from_file(str(xml_path)).compile()
+    data = mujoco.MjData(model)
+    data.qpos[:] = model.qpos0
+    mujoco.mj_forward(model, data)
+    r = 0.0
+    half_depth = 0.0
+    for g in range(model.ngeom):
+        if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE:
+            continue
+        centre, half = model.geom_aabb[g][:3], model.geom_aabb[g][3:]
+        rot = data.geom_xmat[g].reshape(3, 3)
+        pos = data.geom_xpos[g]
+        corners = []
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                for sz in (-1, 1):
+                    corners.append(pos + rot @ (centre + half * np.array([sx, sy, sz], float)))
+        if min(c[2] for c in corners) < below:
+            r = max(r, max(float(np.hypot(c[0] - model.qpos0[0], c[1] - model.qpos0[1])) for c in corners))
+            half_depth = max(half_depth,
+                             max(abs(float(c[0] - model.qpos0[0])) for c in corners),
+                             max(abs(float(c[1] - model.qpos0[1])) for c in corners))
+    return r, half_depth
+
+
 def _init_robot():
-    """Resolve the robot MJCF (adding a floating base if needed) and its stand height, once."""
-    global _ROBOT_XML, _BASE_Z
+    """Resolve the robot MJCF (adding a floating base if needed), its stand height and its radius."""
+    global _ROBOT_XML, _BASE_Z, ROBOT_RADIUS, DOCK_HALF, GOAL
     if _ROBOT_XML is None:
         _ROBOT_XML = floating_base_xml(G1_XML)
         _BASE_Z = base_stand_height(_ROBOT_XML)
+        r, half = base_footprint(_ROBOT_XML)
+        ROBOT_RADIUS = r + BASE_MARGIN
+        DOCK_HALF = half + DOCK_MARGIN
+        # Plan to a pose that is genuinely outside the inflated place table; the final approach to the
+        # table face is a straight dock, the way nav/table_align.py does it on the robot.
+        GOAL = (CONT_XY[0], PLACE_NEAR_EDGE - ROBOT_RADIUS - 0.12)
     return _ROBOT_XML, _BASE_Z
 
 
@@ -170,18 +227,56 @@ def plan_path(packages):
     return N.plan(occupancy(packages), START, GOAL)
 
 
-def random_packages(rng, n=3, tries=200):
-    """Sample n package poses in the corridor that leave a collision-free A* path start->goal."""
+def path_clearance(pkgs, path):
+    """Smallest distance from any path waypoint to any package footprint corner."""
+    grid = occupancy(pkgs)
+    pts = [grid.c2w(r, c) for r, c in path]
+    worst = np.inf
+    for px, py, yaw in pkgs:
+        c, s = np.cos(np.radians(yaw)), np.sin(np.radians(yaw))
+        hx = abs(PKG[0] * c) + abs(PKG[1] * s)
+        hy = abs(PKG[0] * s) + abs(PKG[1] * c)
+        for wx, wy in pts:
+            dx = max(abs(wx - px) - hx, 0.0)
+            dy = max(abs(wy - py) - hy, 0.0)
+            worst = min(worst, float(np.hypot(dx, dy)))
+    return worst
+
+
+def random_packages(rng, n=2, tries=400, clearance=0.12):
+    """Lay out corridor obstacles that a base of the ACTUAL width can route around, and verify it.
+
+    Rejection sampling does not work at this scale. The wheeled G1-D circumscribes at ~0.43 m, so
+    inflating any obstacle covers ~1.2 m of corridor; uniform sampling essentially never produces a
+    layout with a gap, and the old sampler only looked like it did because it inflated by a guessed
+    0.18 m and then drove the base straight through the boxes.
+
+    So the layout is CONSTRUCTED: one obstacle near the centre line to force a real detour, the rest
+    offset to alternating sides far enough that the inflated lane stays open. Margins are held well
+    above the 4 cm grid resolution, because inflation rounds outward and a metrically-open lane one
+    cell wide closes under discretisation. The result is then planned and re-checked for clearance,
+    the same as any layout would be.
+    """
+    _init_robot()
+    pkg_reach = float(np.hypot(PKG[0], PKG[1]))     # worst-case half-extent of a rotated package
+    side = ROBOT_RADIUS + pkg_reach + clearance
+    span = GOAL[1] - START[1]
     for _ in range(tries):
-        pkgs = []
-        for _ in range(n):
-            pkgs.append((float(rng.uniform(-0.38, 0.38)), float(rng.uniform(0.45, 1.55)), float(rng.uniform(0, 90))))
-        # keep them apart and clear of start/goal
-        ok = all(np.hypot(p[0] - q[0], p[1] - q[1]) > 0.42 for i, p in enumerate(pkgs) for q in pkgs[i + 1:])
-        ok = ok and all(np.hypot(p[0], p[1] - 0.0) > 0.4 and np.hypot(p[0], p[1] - GOAL[1]) > 0.4 for p in pkgs)
-        if ok and plan_path(pkgs) is not None:
+        pkgs = [(float(rng.uniform(-0.10, 0.10)),
+                 float(START[1] + span * rng.uniform(0.30, 0.42)),
+                 float(rng.uniform(0, 90)))]
+        # The remaining boxes sit well outside the detour so they dress the corridor without
+        # narrowing it further -- one obstacle in the lane is all a base this wide can route around.
+        for i in range(1, n):
+            pkgs.append((float((-1.0 if i % 2 else 1.0) * (side + 0.85 + rng.uniform(0.0, 0.20))),
+                         float(START[1] + span * (0.45 + 0.25 * (i - 1)) + rng.uniform(-0.08, 0.08)),
+                         float(rng.uniform(0, 90))))
+        path = plan_path(pkgs)
+        if path is not None and path_clearance(pkgs, path) >= clearance:
             return pkgs
-    return [(0.32, 0.6, 20), (-0.34, 1.05, -30), (0.34, 1.55, 15)]   # fallback (known solvable)
+    side_x = ROBOT_RADIUS + float(np.hypot(PKG[0], PKG[1])) + clearance + 0.85
+    mid = START[1] + (GOAL[1] - START[1]) * 0.38
+    return [(0.0, mid, 20), (-side_x, mid + 0.60, -30), (side_x, mid + 1.10, 15)]
 
 
 def quat_z(deg):

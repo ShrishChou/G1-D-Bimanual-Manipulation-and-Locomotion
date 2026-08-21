@@ -38,7 +38,7 @@ PALM_OFFSET = np.array([0.06, 0.0, 0.0])     # wrist frame -> palm centre
 POSTURE_L = np.array([-0.45, 0.28, 0.05, 0.95, 0.0, 0.0, -0.35])
 POSTURE_R = np.array([-0.45, -0.28, -0.05, 0.95, 0.0, 0.0, 0.35])
 OPEN = np.zeros(7)
-CLOSED = np.array([0.5, 0.9, 0.7, 0.9, 0.8, 0.9, 0.8])   # thumb wraps, index+middle curl
+THUMB_FRACTION = 0.45      # how far the two straddling thumb joints swing at full closure
 
 
 class Kin:
@@ -52,6 +52,8 @@ class Kin:
         self.q_handR, _ = self._adr(HAND_R)
         self.lim_armL = np.array([model.jnt_range[self._jid(n)] for n in ARM_L])
         self.lim_armR = np.array([model.jnt_range[self._jid(n)] for n in ARM_R])
+        self.lim_handL = np.array([model.jnt_range[self._jid(n)] for n in HAND_L])
+        self.lim_handR = np.array([model.jnt_range[self._jid(n)] for n in HAND_R])
         self.q_wheels = self._adr_opt(WHEELS)
         self.q_lift = self._adr_opt(LIFT)
         self.lift_max = (float(model.jnt_range[self._jid(LIFT[0])][1])
@@ -146,16 +148,80 @@ class Kin:
         mujoco.mj_kinematics(self.m, data)
         return best, best_err
 
-    def ik_bimanual(self, data, center, half_width=0.085, **kw):
-        """Both palms on opposite sides of `center` (world frame, cylinder assumed upright).
+    def ik_bimanual(self, data, center, half_width=0.085, lateral=(0.0, 1.0, 0.0), **kw):
+        """Both palms on opposite sides of `center`, offset along `lateral` (the robot's LEFT axis).
+
+        `lateral` matters: the offset is the robot's left/right direction, not world +y. Hardcoding
+        world +y works only while the robot happens to face +x -- once it turns to face the place
+        table the same call puts one palm in front of the object and the other behind it, and the
+        solve blows up to a metre-scale residual instead of failing loudly.
 
         Returns (qL, qR, worst_position_error_m).
         """
-        tL = np.array(center) + np.array([0.0, half_width, 0.0])
-        tR = np.array(center) + np.array([0.0, -half_width, 0.0])
+        lat = np.asarray(lateral, float)
+        lat = lat / (np.linalg.norm(lat) + 1e-12)
+        tL = np.array(center, float) + lat * half_width
+        tR = np.array(center, float) - lat * half_width
         qL, eL = self.ik_arm(data, "L", tL, **kw)
         qR, eR = self.ik_arm(data, "R", tR, **kw)
         return qL, qR, max(eL, eR)
+
+    # ---- grasping -----------------------------------------------------------
+    def closed_pose(self, side, fraction=1.0):
+        """Finger angles at `fraction` of full closure, derived from the joint LIMITS.
+
+        The two Dex3 hands are mirrored: left middle/index close negative and right positive, left
+        thumb_2 closes positive and right negative. A single hand-authored "closed" vector applied to
+        both therefore closes one hand and is silently clamped to zero on the other -- which is exactly
+        what made the object look like it was passing through an open left hand. Reading the direction
+        off each joint's own range makes the pose correct on either hand by construction.
+        """
+        lim = self.lim_handL if side == "L" else self.lim_handR
+        out = np.zeros(7)
+        for i, (lo, hi) in enumerate(lim):
+            if abs(lo) < 1e-9:            # one-sided, closes positive
+                out[i] = hi * fraction
+            elif abs(hi) < 1e-9:          # one-sided, closes negative
+                out[i] = lo * fraction
+            else:                         # straddles zero (thumb base): mirror by side
+                out[i] = (hi if side == "L" else lo) * THUMB_FRACTION * fraction
+        return out
+
+    def close_on_object(self, data, obj_geoms, apply_fn, lo=0.0, hi=1.0, steps=14, back_off=0.06):
+        """Close both hands until the fingers first touch `obj_geoms`, then ease off slightly.
+
+        Bisects the closure fraction against MuJoCo's own contact detection rather than trusting a
+        hand-tuned angle, so the fingers land ON the surface for whatever object radius is in the
+        scene. `apply_fn(fraction)` must pose the hands and refresh kinematics.
+        """
+        obj = set(obj_geoms)
+        hand = self._hand_geoms(data)
+
+        def touching(f):
+            apply_fn(f)
+            for c in data.contact[: data.ncon]:
+                if (c.geom1 in obj and c.geom2 in hand) or (c.geom2 in obj and c.geom1 in hand):
+                    return True
+            return False
+
+        if not touching(hi):
+            return hi                       # never reaches the object; stay fully closed
+        for _ in range(steps):
+            mid = 0.5 * (lo + hi)
+            if touching(mid):
+                hi = mid
+            else:
+                lo = mid
+        return max(0.0, hi * (1.0 - back_off))
+
+    def _hand_geoms(self, data):
+        if getattr(self, "_hg", None) is None:
+            bodies = {i for i in range(self.m.nbody)
+                      if "hand" in (mujoco.mj_id2name(self.m, mujoco.mjtObj.mjOBJ_BODY, i) or "")}
+            self._hg = {g for g in range(self.m.ngeom) if self.m.geom_bodyid[g] in bodies}
+        return self._hg
+
+    _hg = None
 
     # ---- wheeled-base extras (no-ops on the legged model) -------------------
     def set_lift(self, data, height):

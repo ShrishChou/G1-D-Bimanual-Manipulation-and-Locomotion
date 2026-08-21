@@ -113,6 +113,30 @@ PICK ──▶ PLAN ──▶ [HUMAN ACCEPT] ──▶ MOVE ──▶ PLACE
   from known obstacles, so tripping on those would make the robot stop constantly. Only points that were *not*
   in the planned map are treated as intrusions.
 
+### Making the twin physically honest
+
+An animation that reads as fake usually has a specific, findable cause. Four here, each fixed by
+measuring the robot rather than picking a number:
+
+| symptom | cause | fix |
+|---|---|---|
+| base drove **through the corridor boxes** | obstacle inflation used a hand-picked 0.18 m; the wheeled base circumscribes at **0.43 m** | radius derived from the chassis footprint (`base_footprint`), so A\* inflates by what the base actually sweeps |
+| base drove **through the table** | the pick standoff was measured to the object, ignoring the table face | stance clamped so the chassis stops one half-depth off the table |
+| object **passed through the hands** | the two Dex3 hands are **mirrored** — one closure vector closes the right hand and is silently clamped to zero on the left | closure derived per hand from each joint's own limits (`closed_pose`) |
+| object was **set down through the container** | the place moved the object to the drop pose and released | carried over the rim, released, then it falls in |
+
+Two more that only showed up once the numbers were right. The base has **two** relevant sizes — the
+circumscribed radius it sweeps when turning in place, and the shallower half-depth it presents when
+driving straight at a table — and using the turning circle for docking parks it ~10 cm too far out,
+which puts the object beyond arm reach. And the grasp offset was hardcoded to world +y, which is the
+robot's lateral axis only while it happens to face +x; at the place table, facing +y, the same call put
+one palm in front of the object and the other behind it and the solve blew up to a **2.6 m** residual.
+Both grasps now solve to 1–2 mm, and the residual is printed on every run so it cannot hide again.
+
+The corridor itself had to get longer. Inflating any centre obstacle by the real 0.43 m radius covers
+about 1.2 m of corridor, which swallowed the original 2.0 m layout whole — no route existed at all, and
+the old configuration only *looked* navigable because it planned with a radius the base does not have.
+
 ### The two-handed grasp
 
 The object is carried **between both palms**, not hanging off one hand, because that is how the taught skill and
