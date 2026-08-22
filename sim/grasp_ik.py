@@ -35,10 +35,17 @@ LIFT = ["LZ_mt_Joint", "LZ_it_Joint"]
 PALM_OFFSET = np.array([0.06, 0.0, 0.0])     # wrist frame -> palm centre
 
 # Natural bimanual carry posture (shoulders forward, elbows bent, wrists rolled inward).
-POSTURE_L = np.array([-0.45, 0.28, 0.05, 0.95, 0.0, 0.0, -0.35])
+POSTURE_L = np.array([-0.45, 0.28, 0.05, 0.95, 0.0, 0.0, -0.35])   # elbow flexed, not straight
 POSTURE_R = np.array([-0.45, -0.28, -0.05, 0.95, 0.0, 0.0, 0.35])
 OPEN = np.zeros(7)
 THUMB_FRACTION = 0.45      # how far the two straddling thumb joints swing at full closure
+
+# The elbow's mechanical range crosses zero, but only one side of it looks like an arm. At negative
+# angles the forearm swings UP and the hands end up pointing at the ceiling -- kinematically valid,
+# visibly wrong, and exactly the pose a position-only IK will happily choose because it reaches the
+# target just as well. Constrain the solver to the flexed half.
+ELBOW_INDEX = 3
+ELBOW_MIN = 0.35           # rad: never hyperextend, and keep a visible natural bend
 
 
 class Kin:
@@ -52,6 +59,8 @@ class Kin:
         self.q_handR, _ = self._adr(HAND_R)
         self.lim_armL = np.array([model.jnt_range[self._jid(n)] for n in ARM_L])
         self.lim_armR = np.array([model.jnt_range[self._jid(n)] for n in ARM_R])
+        for lim in (self.lim_armL, self.lim_armR):
+            lim[ELBOW_INDEX, 0] = max(lim[ELBOW_INDEX, 0], ELBOW_MIN)
         self.lim_handL = np.array([model.jnt_range[self._jid(n)] for n in HAND_L])
         self.lim_handR = np.array([model.jnt_range[self._jid(n)] for n in HAND_R])
         self.q_wheels = self._adr_opt(WHEELS)
@@ -112,7 +121,7 @@ class Kin:
                 break
         return best, best_err
 
-    def _ik_arm_once(self, data, side, target, q0, iters=200, damping=0.02, posture_gain=0.015, step=0.9):
+    def _ik_arm_once(self, data, side, target, q0, iters=200, damping=0.02, posture_gain=0.06, step=0.9):
         """One damped-least-squares solve from a single seed."""
         qadr = self.q_armL if side == "L" else self.q_armR
         vadr = self.v_armL if side == "L" else self.v_armR

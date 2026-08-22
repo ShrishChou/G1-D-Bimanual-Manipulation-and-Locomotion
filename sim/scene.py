@@ -78,10 +78,10 @@ _BASE_Z = None
 def floating_base_xml(path):
     """Return an MJCF guaranteed to have a floating base, writing a sibling file if one is needed.
 
-    The wheeled G1-D's URDF roots at ``AGV_link`` through a fixed joint, so the importer folds the
-    chassis straight into the worldbody: the robot is bolted to the origin and cannot be driven
-    anywhere. Wrap the worldbody's bodies AND its loose geoms in one free-jointed body -- the chassis
-    and the outer lift column are worldbody geoms, and leaving them behind strands them at the origin
+    Some robot descriptions root at a chassis link attached by a fixed joint. The importer folds that
+    link straight into the worldbody, so the robot ends up bolted to the origin and cannot be driven
+    anywhere. Wrap the worldbody's bodies AND its loose geoms in one free-jointed body: parts of the
+    chassis commonly survive as worldbody geoms, and leaving them behind strands them at the origin
     while the rest of the robot drives off. No-op when the asset already has a free joint.
 
     The rewritten file is written beside the source so ``compiler meshdir`` still resolves.

@@ -275,8 +275,8 @@ python nav/nav_planner.py --demo --out /tmp/plan.png     # planner self-test alo
 python sim/render_demo.py                                # all three scenarios + the plan figure
 python sim/render_demo.py --scenarios deploy             # just the staged deployment sequence
 
-# render against a different robot (e.g. the wheeled G1-D, if you have it)
-G1_XML=/path/to/g1d_dex3.xml python sim/render_demo.py
+# render against a different robot (any MJCF with the same arm/hand joint names)
+G1_XML=/path/to/your_robot.xml python sim/render_demo.py
 ```
 
 On macOS prefix with `MUJOCO_GL=cgl`; on a headless Linux box use `MUJOCO_GL=egl`.
@@ -330,6 +330,13 @@ Hardware and training add: `unitree_sdk2py` (DDS + `LocoClient`), ROS 2 + Nav2 +
   `deploy/deploy_pick.py` orchestrator. Fusing them into one autonomous run is the current edge of the work.
 - Offline metrics rank checkpoints and catch mode collapse; they cannot capture closed-loop compounding error.
   The real gate is on-robot success (`eval/spatial_heatmap.py`).
+
+## What is not here
+
+No trained weights, no datasets, no robot assets. The GR00T checkpoints, the teleoperation recordings
+and the wheeled-base description used to render the clips all stay where they are; this repository is
+the pipeline, the control logic and the evaluation method. The one robot model it will fetch is the
+public Unitree G1 + Dex3 from MuJoCo Menagerie.
 
 ## Provenance
 
