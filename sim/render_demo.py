@@ -25,6 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "nav"))
 sys.path.insert(0, HERE)
 
+import grasp_ik as G         # noqa: E402
 import nav_fsm as F          # noqa: E402
 import nav_planner as N      # noqa: E402
 import scene as S            # noqa: E402
@@ -139,9 +140,15 @@ def run_deploy_sequence(io, place_target):
         io.drive(0.0, np.clip(2.0 * err, -F.W_TURN, F.W_TURN), 1 / 30); io.render()
     hold()
 
-    # 3) arms to the inference start pose (open, pre-grasp standoff)
+    # 3) arms to the inference start pose.
+    #
+    # This is a FIXED joint configuration, not an IK solve onto the object -- on the robot it is the
+    # recorded episode start pose that goto_start.py drives to, and the policy is what closes the gap
+    # from there. Solving IK here instead is wrong twice over: the object is still ~0.6 m away at this
+    # stage, which is outside the workspace, so the solver saturates and the arms splay out straight
+    # reaching at nothing.
     log.append("3) arms -> inference start pose")
-    qL0, qR0, _ = io._solve_grasp(obj, F.GRASP_HALF_W + F.PREGRASP_BACK, back=F.PREGRASP_BACK)
+    qL0, qR0 = G.POSTURE_L.copy(), G.POSTURE_R.copy()
     for i in range(24):
         a = i / 23.0
         io.armL = F.ARM_HOME + (qL0 - F.ARM_HOME) * a
